@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <sys/wait.h>
 #include <dirent.h>
+#include <signal.h>
 
 typedef struct {
     int    id;
@@ -136,66 +137,67 @@ int parse_condition(const char *input, char *field, char *op, char *value) {
 int match_condition(const Report *r, const char *field, const char *op, const char *value) {
     if (strcmp(field, "severity") == 0) {
         int v = atoi(value);
-        if (strcmp(op, "==") == 0) {
-            return r->severity == v;
-        }
-        if (strcmp(op, "!=") == 0) {
-            return r->severity != v;
-        }
-        if (strcmp(op, "<")  == 0) {
-            return r->severity <  v;
-        }
-        if (strcmp(op, "<=") == 0) {
-            return r->severity <= v;
-        }
-        if (strcmp(op, ">")  == 0) {
-            return r->severity >  v;
-        }
-        if (strcmp(op, ">=") == 0) {
-            return r->severity >= v;
-        }
+        if (strcmp(op, "==") == 0) return r->severity == v;
+        if (strcmp(op, "!=") == 0) return r->severity != v;
+        if (strcmp(op, "<")  == 0) return r->severity <  v;
+        if (strcmp(op, "<=") == 0) return r->severity <= v;
+        if (strcmp(op, ">")  == 0) return r->severity >  v;
+        if (strcmp(op, ">=") == 0) return r->severity >= v;
     }
     if (strcmp(field, "category") == 0) {
         int cmp = strcmp(r->category, value);
-        if (strcmp(op, "==") == 0) {
-            return cmp == 0;
-        }
-        if (strcmp(op, "!=") == 0) {
-            return cmp != 0;
-        }
+        if (strcmp(op, "==") == 0) return cmp == 0;
+        if (strcmp(op, "!=") == 0) return cmp != 0;
     }
     if (strcmp(field, "inspector") == 0) {
         int cmp = strcmp(r->inspector, value);
-        if (strcmp(op, "==") == 0) {
-            return cmp == 0;
-        }
-        if (strcmp(op, "!=") == 0) {
-            return cmp != 0;
-        }
+        if (strcmp(op, "==") == 0) return cmp == 0;
+        if (strcmp(op, "!=") == 0) return cmp != 0;
     }
     if (strcmp(field, "timestamp") == 0) {
         time_t v = (time_t)atol(value);
-        if (strcmp(op, "==") == 0) {
-            return r->timestamp == v;
-        }
-        if (strcmp(op, "!=") == 0) {
-            return r->timestamp != v;
-        }
-        if (strcmp(op, "<")  == 0) {
-            return r->timestamp <  v;
-        }
-        if (strcmp(op, "<=") == 0) {
-            return r->timestamp <= v;
-        }
-        if (strcmp(op, ">")  == 0) {
-            return r->timestamp >  v;
-        }
-        if (strcmp(op, ">=") == 0) {
-            return r->timestamp >= v;
-        }
+        if (strcmp(op, "==") == 0) return r->timestamp == v;
+        if (strcmp(op, "!=") == 0) return r->timestamp != v;
+        if (strcmp(op, "<")  == 0) return r->timestamp <  v;
+        if (strcmp(op, "<=") == 0) return r->timestamp <= v;
+        if (strcmp(op, ">")  == 0) return r->timestamp >  v;
+        if (strcmp(op, ">=") == 0) return r->timestamp >= v;
     }
     fprintf(stderr, "Unknown field or operator: %s %s\n", field, op);
     return 0;
+}
+
+/* ----------------------------------------------------------------
+ * Phase 2: Notify monitor_reports via SIGUSR1.
+ * Reads PID from .monitor_pid, sends SIGUSR1.
+ * Returns 1 on success, 0 on failure.
+ * The log message is written by the caller (cmd_add).
+ * ---------------------------------------------------------------- */
+static int notify_monitor(void) {
+    int fd = open(".monitor_pid", O_RDONLY);
+    if (fd < 0) {
+        return 0;   /* file does not exist – monitor not running */
+    }
+
+    char buf[32];
+    memset(buf, 0, sizeof(buf));
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
+    if (n <= 0) {
+        return 0;
+    }
+
+    pid_t pid = (pid_t)atol(buf);
+    if (pid <= 0) {
+        return 0;
+    }
+
+    if (kill(pid, SIGUSR1) != 0) {
+        return 0;
+    }
+
+    return 1;
 }
 
 void cmd_add(const char *district, const char *role, const char *user) {
@@ -266,11 +268,24 @@ void cmd_add(const char *district, const char *role, const char *user) {
     chmod(dat_path, 0664);
     update_symlink(district);
 
-    char action[64];
-    snprintf(action, sizeof(action), "add report ID=%d", r.id);
+    /* Phase 2: notify monitor and log the outcome */
+    int notified = notify_monitor();
+    char action[128];
+    if (notified) {
+        snprintf(action, sizeof(action),
+                 "add report ID=%d; monitor notified via SIGUSR1", r.id);
+    } else {
+        snprintf(action, sizeof(action),
+                 "add report ID=%d; monitor could not be informed (not running or error)", r.id);
+    }
     log_action(district, role, user, action);
 
     printf("Report %d added to district '%s'.\n", r.id, district);
+    if (notified) {
+        printf("Monitor process notified (SIGUSR1 sent).\n");
+    } else {
+        printf("WARNING: Monitor process could not be notified.\n");
+    }
 }
 
 void cmd_list(const char *district, const char *role, const char *user) {
@@ -423,10 +438,8 @@ void cmd_remove_report(const char *district, const char *role, const char *user,
         if (n != sizeof(Report)) {
             break;
         }
-
         lseek(fd, write_pos, SEEK_SET);
         write(fd, &r, sizeof(Report));
-
         read_pos  += sizeof(Report);
         write_pos += sizeof(Report);
     }
@@ -543,6 +556,78 @@ void cmd_filter(const char *district, const char *role, const char *user,
     log_action(district, role, user, "filter");
 }
 
+/* ----------------------------------------------------------------
+ * Phase 2: remove_district
+ * Manager only. Forks a child that runs rm -rf on the district
+ * directory, then removes the active_reports-* symlink.
+ * ---------------------------------------------------------------- */
+void cmd_remove_district(const char *district, const char *role, const char *user) {
+    if (strcmp(role, "manager") != 0) {
+        fprintf(stderr, "ERROR: Only managers can remove districts.\n");
+        return;
+    }
+
+    /* Safety check: district name must not be empty or contain dangerous chars */
+    if (district == NULL || district[0] == '\0' ||
+        strchr(district, '/') != NULL || strchr(district, '.') != NULL) {
+        fprintf(stderr, "ERROR: Invalid district name '%s'.\n",
+                district ? district : "(null)");
+        return;
+    }
+
+    /* Check that the district directory exists */
+    struct stat st;
+    if (stat(district, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "ERROR: District '%s' does not exist.\n", district);
+        return;
+    }
+
+    printf("Removing district '%s'...\n", district);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return;
+    }
+
+    if (pid == 0) {
+        /* Child: execute rm -rf <district> */
+        execlp("rm", "rm", "-rf", district, (char *)NULL);
+        /* If exec fails, exit child with error */
+        perror("execlp rm");
+        _exit(1);
+    }
+
+    /* Parent: wait for child */
+    int status;
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid");
+        return;
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "ERROR: rm -rf failed for district '%s'.\n", district);
+        return;
+    }
+
+    /* Remove the active_reports symlink */
+    char sym_name[256];
+    snprintf(sym_name, sizeof(sym_name), "active_reports-%s", district);
+    struct stat lst;
+    if (lstat(sym_name, &lst) == 0) {
+        if (unlink(sym_name) != 0) {
+            perror("unlink symlink");
+        } else {
+            printf("Symlink '%s' removed.\n", sym_name);
+        }
+    }
+
+    printf("District '%s' successfully removed.\n", district);
+
+    /* We cannot log into the district log since it's been deleted.
+       Log to stdout only (already done above). */
+}
+
 void print_usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
@@ -550,9 +635,10 @@ void print_usage(const char *prog) {
         "  %s --role <manager|inspector> --user <name> list <district>\n"
         "  %s --role <manager|inspector> --user <name> view <district> <report_id>\n"
         "  %s --role manager             --user <name> remove_report <district> <report_id>\n"
+        "  %s --role manager             --user <name> remove_district <district>\n"
         "  %s --role manager             --user <name> update_threshold <district> <value>\n"
         "  %s --role <manager|inspector> --user <name> filter <district> <field:op:value> ...\n",
-        prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char *argv[]) {
@@ -619,6 +705,14 @@ int main(int argc, char *argv[]) {
         district = argv[cmd_idx + 1];
         int rid  = atoi(argv[cmd_idx + 2]);
         cmd_remove_report(district, role, user, rid);
+
+    } else if (strcmp(cmd, "remove_district") == 0) {
+        if (cmd_idx + 1 >= argc) {
+            fprintf(stderr, "ERROR: remove_district requires <district>\n");
+            return 1;
+        }
+        district = argv[cmd_idx + 1];
+        cmd_remove_district(district, role, user);
 
     } else if (strcmp(cmd, "update_threshold") == 0) {
         if (cmd_idx + 2 >= argc) {
